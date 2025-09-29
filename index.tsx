@@ -71,17 +71,21 @@ const App: React.FC = () => {
   const [view, setView] = useState<View>('list');
   const [timedTaskId, setTimedTaskId] = useState<string | null>(null);
   const [isInIframe, setIsInIframe] = useState(false);
+  const [isDistracted, setIsDistracted] = useState(false);
+  const [widgetError, setWidgetError] = useState<string | null>(null);
 
   // Refs for timer and file import
   const pipWindowRef = useRef<Window | null>(null);
   const timerIntervalRef = useRef<number | null>(null);
-  const isDistractedRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Check if running in an iframe and alert the user
+  // Check if running in an iframe
   useEffect(() => {
-    if (window.top !== window) {
-      setIsInIframe(true);
+    try {
+        setIsInIframe(window.self !== window.top);
+    } catch (e) {
+        // Fallback for cross-origin iframes
+        setIsInIframe(true);
     }
   }, []);
 
@@ -117,7 +121,6 @@ const App: React.FC = () => {
     setTasks(prevTasks => [...prevTasks, newTask]);
   };
   
-  // Automatically sort tasks by impact/effort ratio for the list view
   const sortedTasks = useMemo(() => {
       return [...tasks].sort((a, b) => {
           const ratioA = a.effort > 0 ? a.impact / a.effort : a.impact;
@@ -126,7 +129,6 @@ const App: React.FC = () => {
       });
   }, [tasks]);
 
-  // Group and sort tasks for the timeline view
   const timelineTasks = useMemo(() => {
     const grouped: Record<TimelineCategory, Task[]> = {
         Overdue: [],
@@ -139,7 +141,6 @@ const App: React.FC = () => {
         const category = getTimelineCategory(task.deadline);
         grouped[category].push(task);
     });
-    // Sort tasks within each category
     for (const category in grouped) {
         grouped[category as TimelineCategory].sort((a, b) => {
              const ratioA = a.effort > 0 ? a.impact / a.effort : a.impact;
@@ -156,119 +157,189 @@ const App: React.FC = () => {
           clearInterval(timerIntervalRef.current);
           timerIntervalRef.current = null;
       }
-      if (pipWindowRef.current) {
+      if (pipWindowRef.current && !pipWindowRef.current.closed) {
           pipWindowRef.current.close();
-          pipWindowRef.current = null;
       }
+      pipWindowRef.current = null;
       setTimedTaskId(null);
   }, []);
 
-  const handleStartTimer = async (taskId: string) => {
+  const renderWidgetContent = useCallback(() => {
+    if (!pipWindowRef.current || pipWindowRef.current.closed) return;
+    const pipDoc = pipWindowRef.current.document;
+    pipDoc.body.innerHTML = ''; // Clear previous content
+
     if (timedTaskId) {
-        alert("Another timer is already running. Please stop it first.");
+        // Render Timer View
+        const task = tasks.find(t => t.id === timedTaskId);
+        if (!task) return; // Should not happen
+        pipDoc.body.innerHTML = `
+            <div class="timer-view">
+                <p id="task-name" title="${task.name}">${task.name}</p>
+                <h1 id="timer-display">${formatTime(task.timeSpent)}</h1>
+                <p class="distraction-label" id="distraction-label" style="display: none;">Distraction: <span id="distraction-time">00:00:00</span></p>
+            </div>`;
+    } else {
+        // Render Task List View
+        const topTasks = sortedTasks.slice(0, 3);
+        const listContainer = pipDoc.createElement('div');
+        listContainer.className = 'task-list';
+        
+        const title = pipDoc.createElement('h2');
+        title.textContent = 'Top 3 Tasks';
+        pipDoc.body.appendChild(title);
+        pipDoc.body.appendChild(listContainer);
+
+        if (topTasks.length > 0) {
+            topTasks.forEach(task => {
+                const item = pipDoc.createElement('div');
+                item.className = 'task-item';
+                
+                const nameSpan = pipDoc.createElement('span');
+                nameSpan.textContent = task.name;
+                nameSpan.title = task.name;
+                
+                const startButton = pipDoc.createElement('button');
+                startButton.textContent = 'Start';
+                startButton.onclick = () => {
+                    setTimedTaskId(task.id);
+                };
+                
+                item.appendChild(nameSpan);
+                item.appendChild(startButton);
+                listContainer.appendChild(item);
+            });
+        } else {
+            listContainer.innerHTML = '<p class="no-tasks">No tasks to show.</p>';
+        }
+    }
+  }, [timedTaskId, tasks, sortedTasks, setTimedTaskId]);
+
+
+  useEffect(() => {
+      // Re-render widget content when timer starts/stops
+      renderWidgetContent();
+  }, [timedTaskId, renderWidgetContent]);
+
+
+  const handleOpenWidget = async () => {
+    if (pipWindowRef.current && !pipWindowRef.current.closed) {
+        pipWindowRef.current.focus();
         return;
     }
-
-    const task = tasks.find(t => t.id === taskId);
-    if (!task) return;
+    if (timedTaskId) {
+        setWidgetError("A timer is already active. Please stop it before opening a new widget.");
+        return;
+    }
 
     if (!('documentPictureInPicture' in window)) {
-        alert('Picture-in-Picture is not supported by your browser.');
+        setWidgetError("Your browser does not support the Picture-in-Picture API required for the focus widget.");
         return;
     }
+    
+    setWidgetError(null); // Clear previous errors
 
     try {
         const pipWindow = await window.documentPictureInPicture.requestWindow({
-            width: 300,
-            height: 150,
+            width: 320,
+            height: 200,
         });
         pipWindowRef.current = pipWindow;
         
-        const timerWidgetStyle = `
-            :root { --primary-color: #007bff; --warning-background: #4d3a05; --font-family: 'Inter', sans-serif;}
-            body { margin: 0; font-family: var(--font-family); color: white; background-color: var(--primary-color); display: flex; justify-content: center; align-items: center; height: 100vh; text-align: center; transition: background-color 0.5s; }
+        const style = `
+            :root { --primary-color: #007bff; --surface-color: #383838; --background-color: #2c2c2c; --warning-background: #4d3a05; --font-family: 'Inter', sans-serif; --text-color: #e0e0e0; }
+            body { margin: 0; font-family: var(--font-family); color: var(--text-color); background-color: var(--background-color); padding: 1rem; height: 100vh; box-sizing: border-box; transition: background-color 0.5s; }
             body.distraction { background-color: var(--warning-background); }
-            .content { padding: 1rem; }
-            h1 { font-size: 2rem; margin: 0; font-weight: 700; }
-            p { font-size: 1rem; margin: 0; opacity: 0.8; }
+            h2 { font-size: 1rem; margin: 0 0 1rem 0; text-align: center; }
+            .task-list { display: flex; flex-direction: column; gap: 0.5rem; }
+            .task-item { background-color: var(--surface-color); padding: 0.5rem; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; }
+            .task-item span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 0.5rem; }
+            .task-item button { padding: 0.25rem 0.5rem; border: none; border-radius: 4px; background-color: #28a745; color: white; cursor: pointer; flex-shrink: 0; }
+            .timer-view { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; text-align: center; }
+            #task-name { font-size: 0.9rem; margin: 0; opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+            .timer-view h1 { font-size: 2.2rem; margin: 0.25rem 0; font-weight: 700; }
+            .distraction-label { font-size: 0.8rem; }
+            .no-tasks { text-align: center; font-size: 0.9rem; opacity: 0.8; padding-top: 1rem; }
         `;
         const styleSheet = new CSSStyleSheet();
-        styleSheet.replaceSync(timerWidgetStyle);
+        styleSheet.replaceSync(style);
         pipWindow.document.adoptedStyleSheets = [styleSheet];
-        
-        pipWindow.document.body.innerHTML = `
-            <div class="content">
-                <p id="task-name">${task.name}</p>
-                <h1 id="timer-display">${formatTime(task.timeSpent)}</h1>
-                <p id="distraction-label" style="display: none;">Distraction: <span id="distraction-time">00:00:00</span></p>
-            </div>`;
 
         pipWindow.addEventListener('pagehide', () => {
             handleStopTimer();
         });
 
-        // Now that the window is open, set the state to trigger the timer effect
-        setTimedTaskId(taskId);
+        renderWidgetContent();
+        setIsDistracted(document.visibilityState === 'hidden');
 
     } catch (error) {
         console.error("Failed to open PiP window:", error);
-        let message = "Failed to open the timer window.";
-        if (error instanceof DOMException && error.name === 'SecurityError') {
-            message += "\n\nThis is likely due to browser security restrictions when running in an embedded window (like a code playground). Please try opening the app in its own browser tab to use this feature.";
-        } else {
-            message += "\n\nThis feature might not be supported by your browser or requires a direct user click.";
-        }
-        alert(message);
-        setTimedTaskId(null);
+        setWidgetError("Could not open focus widget. This feature may be blocked by your browser or another widget may be open.");
     }
   };
 
-  // Effect to manage the timer logic once the PiP window is open
+
   useEffect(() => {
-      if (!timedTaskId || !pipWindowRef.current) {
-          return;
-      }
-      
-      const pipWindow = pipWindowRef.current;
+    if (!timedTaskId) return;
 
-      timerIntervalRef.current = window.setInterval(() => {
-          setTasks(currentTasks => 
-              currentTasks.map(t => {
-                  if (t.id === timedTaskId) {
-                      const newTimeSpent = isDistractedRef.current ? t.timeSpent : t.timeSpent + 1;
-                      const newDistractionTime = isDistractedRef.current ? t.distractionTime + 1 : t.distractionTime;
-                      
-                      const timerDisplay = pipWindow.document.getElementById('timer-display');
-                      if (timerDisplay) timerDisplay.textContent = formatTime(newTimeSpent);
+    // This effect starts/stops the master timer interval
+    timerIntervalRef.current = window.setInterval(() => {
+      setTasks(currentTasks =>
+        currentTasks.map(t => {
+          if (t.id === timedTaskId) {
+            const newTimeSpent = isDistracted ? t.timeSpent : t.timeSpent + 1;
+            const newDistractionTime = isDistracted ? t.distractionTime + 1 : t.distractionTime;
 
-                      const distractionLabel = pipWindow.document.getElementById('distraction-label');
-                      const distractionTime = pipWindow.document.getElementById('distraction-time');
-                      if (distractionLabel && distractionTime) {
-                        distractionLabel.style.display = newDistractionTime > 0 ? 'block' : 'none';
-                        distractionTime.textContent = formatTime(newDistractionTime);
-                      }
+            if (pipWindowRef.current && !pipWindowRef.current.closed) {
+              const timerDisplay = pipWindowRef.current.document.getElementById('timer-display');
+              if (timerDisplay) timerDisplay.textContent = formatTime(newTimeSpent);
 
-                      return { ...t, timeSpent: newTimeSpent, distractionTime: newDistractionTime };
-                  }
-                  return t;
-              })
-          );
-      }, 1000);
-      
-      const handleVisibilityChange = () => {
-          isDistractedRef.current = document.visibilityState === 'hidden';
-          if (pipWindowRef.current) {
-              pipWindowRef.current.document.body.classList.toggle('distraction', isDistractedRef.current);
+              const distractionLabel = pipWindowRef.current.document.getElementById('distraction-label');
+              const distractionTimeEl = pipWindowRef.current.document.getElementById('distraction-time');
+              if (distractionLabel && distractionTimeEl) {
+                distractionLabel.style.display = newDistractionTime > 0 ? 'block' : 'none';
+                distractionTimeEl.textContent = formatTime(newDistractionTime);
+              }
+            }
+            return { ...t, timeSpent: newTimeSpent, distractionTime: newDistractionTime };
           }
-      };
+          return t;
+        })
+      );
+    }, 1000);
 
-      document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+      }
+    };
+  }, [timedTaskId, isDistracted]);
 
-      return () => {
-          document.removeEventListener('visibilitychange', handleVisibilityChange);
-          handleStopTimer();
-      };
-  }, [timedTaskId, handleStopTimer]);
+  useEffect(() => {
+    // This effect handles distraction tracking
+    const handleVisibilityChange = () => {
+      const distracted = document.visibilityState === 'hidden';
+      setIsDistracted(distracted);
+      if (pipWindowRef.current && !pipWindowRef.current.closed) {
+        pipWindowRef.current.document.body.classList.toggle('distraction', distracted);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    
+    // Also check if PiP window was closed manually
+    const checkPipClosedInterval = setInterval(() => {
+      if (pipWindowRef.current && pipWindowRef.current.closed) {
+        handleStopTimer();
+      }
+    }, 500);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      clearInterval(checkPipClosedInterval);
+    };
+  }, [handleStopTimer]);
+
   
   const handleExport = () => {
     if (tasks.length === 0) {
@@ -303,7 +374,6 @@ const App: React.FC = () => {
                 throw new Error("File could not be read.");
             }
             const importedTasks = JSON.parse(text);
-            // Basic validation
             if (Array.isArray(importedTasks) && (importedTasks.length === 0 || importedTasks[0].id)) {
                  if (confirm("This will replace all current tasks. Are you sure?")) {
                     setTasks(importedTasks);
@@ -315,7 +385,6 @@ const App: React.FC = () => {
             console.error("Failed to import tasks:", error);
             alert(`Failed to import tasks. Please make sure it's a valid JSON file. Error: ${error.message}`);
         } finally {
-            // Reset file input value to allow re-uploading the same file
             if(fileInputRef.current) {
                 fileInputRef.current.value = '';
             }
@@ -324,14 +393,22 @@ const App: React.FC = () => {
     reader.readAsText(file);
   };
 
+  if (isInIframe) {
+    return (
+      <div className="launcher-container">
+        <div className="launcher-box">
+          <h1>Productivity Hub</h1>
+          <p>For full functionality, including the Focus Widget, the app must run in its own tab.</p>
+          <button className="btn btn-launch" onClick={() => window.open(window.location.href, '_blank')}>
+            🚀 Launch in New Tab
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="container">
-      {isInIframe && (
-        <div className="iframe-warning">
-            <p><strong>Note:</strong> The Picture-in-Picture timer may not work in this embedded view. For full functionality, please open the app in a new tab.</p>
-        </div>
-      )}
       <header className="header">
         <h1>Productivity Hub</h1>
         <div className="view-toggle">
@@ -343,6 +420,12 @@ const App: React.FC = () => {
           <span>Timeline</span>
         </div>
       </header>
+      
+      <div className="task-controls">
+         <button className="btn btn-primary" onClick={handleOpenWidget}>Open Focus Widget</button>
+      </div>
+      {widgetError && <p className="error-message">{widgetError}</p>}
+
 
       <TaskForm onSubmit={addTask} />
       
@@ -367,9 +450,6 @@ const App: React.FC = () => {
                             <span>Distraction: {formatTime(task.distractionTime)}</span>
                         </div>
                     </div>
-                    <div className="task-actions">
-                        <button className="btn btn-timer" onClick={() => handleStartTimer(task.id)}>Start Timer</button>
-                    </div>
                 </div>
             ))}
         </div>
@@ -387,6 +467,9 @@ const App: React.FC = () => {
                                 <span>E: {task.effort}</span>
                             </div>
                             <p>Deadline: {task.deadline}</p>
+                             <div className="task-meta-timeline">
+                                <span>Time: {formatTime(task.timeSpent)}</span>
+                            </div>
                         </div>
                     ))}
                 </div>
